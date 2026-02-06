@@ -4,20 +4,393 @@
 from __future__ import annotations
 
 import argparse
+import json
+import random
+import sys
+import tarfile
 from datetime import datetime
 from pathlib import Path
+from typing import Iterable, Sequence
 
 import numpy as np
 import pandas as pd
 from sklearn.metrics import accuracy_score
+from sklearn.model_selection import train_test_split
 
 from binary_baselines import BASELINE_METHODS, evaluate_predictions, run_all_methods
-import gaussian_mixture_fast_common as gm_common
-import gaussian_mixture_pipeline as gm_pipeline
 
 
-DEFAULT_CACHE_PATH = gm_common.CACHE_DIR / "care_tensor_results.json"
-CARE_TENSOR_STATE_DIR = gm_common.CACHE_DIR / "care_tensor_state"
+SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = SCRIPT_DIR.parent
+SRC_ROOT = REPO_ROOT / "src"
+DATA_ROOT = REPO_ROOT / "data"
+JUDGE_OUTPUT_ROOT = REPO_ROOT / "judge_outputs" / "gaussian_mixture"
+RESULTS_DIR = REPO_ROOT / "results"
+CACHE_DIR = REPO_ROOT / "outputs" / "gaussian_mixture"
+
+if str(SRC_ROOT) not in sys.path:
+    sys.path.append(str(SRC_ROOT))
+
+from dataset_aliases import normalize_dataset_list, normalize_gaussian_mixture_dataset
+
+
+FAST_TENSOR_OPTS = {
+    "max_iters": 6,
+    "early_stop_patience": 50,
+    "improvement_tol": 1e-3,
+}
+
+SCORE_COLUMN_CANDIDATES = [
+    "parsed_output",
+    "score_original_order",
+    "score_ab",
+    "pred_label_num",
+    "pred_label_binary",
+]
+
+PREF_LABEL_MAP = {
+    "a": 0.0,
+    "model_a": 0.0,
+    "left": 0.0,
+    "b": 1.0,
+    "model_b": 1.0,
+    "right": 1.0,
+}
+
+PREF_NULL_VALUES = {"tie", "none", "nan", ""}
+
+DATASET_CONFIGS = [
+    {
+        "name": "civilcomments",
+        "label_source": "csv",
+        "label_path": DATA_ROOT / "binary" / "civilcomments.csv",
+        "label_column": "label",
+        "judge_subdir": "civilcomments",
+        "min_rating": 0.0,
+        "max_rating": 9.0,
+        "binary_threshold": 4.5,
+        "score_columns": ["parsed_output"],
+        "ranks": (4, 5, 6, 7),
+    },
+    {
+        "name": "pku_better",
+        "label_source": "judge",
+        "label_column": "gold_label_binary",
+        "pref_label_column": "pref_A_or_B",
+        "judge_subdir": "pku_better",
+        "min_rating": -3.0,
+        "max_rating": 3.0,
+        "binary_threshold": 0.0,
+        "score_columns": ["score_original_order", "score_ab"],
+        "ranks": (4, 5, 6, 7),
+    },
+]
+
+LAM_L_GRID = [1e-3, 5e-3, 1e-2, 5e-2, 1e-1]
+LAM_S_GRID = [1e-3, 5e-3, 1e-2, 5e-2, 1e-1]
+
+VALIDATION_FRACTION = 0.15
+CARE_SVD_GAMMA_GRID = [0.1, 0.2, 0.25, 0.5, 0.75, 1, 2, 3, 5, 7, 10]
+PREFERENCE_DATASETS = {"pku_better"}
+
+DEFAULT_CACHE_PATH = CACHE_DIR / "care_tensor_results.json"
+CARE_TENSOR_STATE_DIR = CACHE_DIR / "care_tensor_state"
+
+
+def set_global_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    try:
+        import torch
+    except ImportError:  # pragma: no cover - torch is optional
+        return
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():  # pragma: no cover - depends on runtime
+        torch.cuda.manual_seed_all(seed)
+
+
+def select_dataset_configs(
+    dataset_configs: Sequence[dict],
+    *,
+    datasets: Iterable[str] | None = None,
+    preference_only: bool = False,
+    preserve_config_order: bool = True,
+) -> list[dict]:
+    if datasets:
+        requested = normalize_dataset_list(datasets, normalize_gaussian_mixture_dataset)
+        name_to_cfg = {cfg["name"]: cfg for cfg in dataset_configs}
+        missing = [name for name in requested if name not in name_to_cfg]
+        if missing:
+            raise ValueError(f"Unknown dataset(s): {', '.join(sorted(missing))}")
+        if preserve_config_order:
+            return [cfg for cfg in dataset_configs if cfg["name"] in requested]
+        return [name_to_cfg[name] for name in requested]
+    if preference_only:
+        return [cfg for cfg in dataset_configs if cfg["name"] in PREFERENCE_DATASETS]
+    return list(dataset_configs)
+
+
+def split_indices(
+    labels: np.ndarray,
+    *,
+    seed: int,
+    val_fraction: float = VALIDATION_FRACTION,
+) -> tuple[np.ndarray, np.ndarray]:
+    indices = np.arange(len(labels))
+    unique_labels = np.unique(labels)
+    if unique_labels.size > 1:
+        idx_rest, idx_val = train_test_split(
+            indices,
+            test_size=val_fraction,
+            random_state=seed,
+            stratify=labels,
+        )
+    else:
+        val_size = max(1, int(round(val_fraction * len(labels))))
+        perm = np.random.default_rng(seed).permutation(indices)
+        idx_val = perm[:val_size]
+        idx_rest = perm[val_size:]
+        if idx_rest.size == 0:
+            idx_rest = idx_val
+    return idx_val, idx_rest
+
+
+def tune_care_svd_gamma(
+    judge_df,
+    labels: np.ndarray,
+    *,
+    idx_val: np.ndarray,
+    threshold: float,
+    gamma_grid: Sequence[float] = CARE_SVD_GAMMA_GRID,
+) -> tuple[float, float, np.ndarray]:
+    from pgm_tools import caresl_aggregate, sanitize_correlation
+
+    best_gamma = float(gamma_grid[0])
+    best_val_acc = float("nan")
+    best_scores = None
+    best_acc = -1.0
+
+    corr_matrix = sanitize_correlation(judge_df.corr())
+    for gamma in gamma_grid:
+        try:
+            scores = caresl_aggregate(
+                judge_df,
+                gamma=float(gamma),
+                verbose=False,
+                corr_matrix=corr_matrix,
+            )
+            preds = np.asarray(scores >= threshold, dtype=int)
+            val_acc = float(accuracy_score(labels[idx_val], preds[idx_val]))
+        except Exception:
+            continue
+        if val_acc > best_acc:
+            best_acc = val_acc
+            best_gamma = float(gamma)
+            best_val_acc = val_acc
+            best_scores = scores
+
+    if best_scores is None:
+        best_scores = caresl_aggregate(
+            judge_df,
+            gamma=best_gamma,
+            verbose=False,
+            corr_matrix=corr_matrix,
+        )
+    return best_gamma, best_val_acc, np.asarray(best_scores, dtype=float)
+
+
+def maybe_remap_score_range(series: pd.Series, dataset: str, judge: str) -> pd.Series:
+    """Map legacy 0-6 preference scores to -3..3 when needed."""
+    numeric = pd.to_numeric(series, errors="coerce")
+    valid = numeric.dropna()
+    if valid.empty:
+        return numeric.astype(float)
+
+    min_val = float(valid.min())
+    max_val = float(valid.max())
+    unique = int(valid.nunique())
+
+    if unique > 1 and min_val >= 0.0 and max_val <= 6.0 and (max_val - min_val) >= 4.5:
+        scaled = (numeric - min_val) / (max_val - min_val)
+        remapped = scaled * 6.0 - 3.0
+        print(f"{dataset}/{judge}: remapped score range [{min_val:.2f}, {max_val:.2f}] -> [-3, 3]")
+        return remapped.astype(float)
+
+    return numeric.astype(float)
+
+
+def _extract_score_from_text(value, min_rating: float, max_rating: float):
+    from data_tools import extract_score_from_parsed_output
+
+    return extract_score_from_parsed_output(
+        value,
+        min_rating=min_rating,
+        max_rating=max_rating,
+    )
+
+
+def extract_pref_labels(df: pd.DataFrame, column: str) -> pd.Series | None:
+    if column not in df.columns:
+        return None
+    normalized = df[column].astype(str).str.strip().str.lower()
+    mapped = normalized.map(PREF_LABEL_MAP)
+    mapped = mapped.where(~normalized.isin(PREF_NULL_VALUES), np.nan)
+    series = pd.to_numeric(mapped, errors="coerce").astype(float)
+    finite = series.dropna()
+    if finite.empty or np.unique(finite).size <= 1:
+        return None
+    return pd.Series(series.to_numpy(dtype=float), index=df.index, dtype=float)
+
+
+def _maybe_flip_all_positive_labels(
+    labels: np.ndarray,
+    judge_df: pd.DataFrame,
+    cfg: dict,
+) -> tuple[np.ndarray, pd.DataFrame]:
+    # Kept as a dedicated hook for future datasets where label polarity is inverted.
+    return labels, judge_df
+
+
+def _json_default(obj):
+    if isinstance(obj, (np.integer, np.floating)):
+        return obj.item()
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+
+def load_cache(path: Path) -> dict:
+    if path.exists():
+        try:
+            return json.loads(path.read_text())
+        except json.JSONDecodeError:
+            return {}
+    return {}
+
+
+def save_cache(cache: dict, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(cache, indent=2, sort_keys=True))
+
+
+def write_individual_json(directory: Path, dataset: str, payload: dict | None) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    data = dict(payload or {})
+    data.setdefault("dataset", dataset)
+    target_path = directory / f"gaussian_mixture_{dataset}.json"
+    target_path.write_text(json.dumps(data, indent=2, sort_keys=True, default=_json_default))
+
+
+def _maybe_extract_pku_better_archive(judge_dir: Path) -> None:
+    if judge_dir.exists() and any(judge_dir.glob("*.csv")):
+        return
+    archive_path = JUDGE_OUTPUT_ROOT / "allenai_preference_test_sets_pku_better.tar.gz"
+    if not archive_path.exists():
+        return
+
+    target_parent = judge_dir.parent
+    target_parent.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(archive_path, "r:gz") as tar:
+        root = target_parent.resolve()
+        for member in tar.getmembers():
+            member_path = (target_parent / member.name).resolve()
+            if root not in member_path.parents and member_path != root:
+                raise ValueError(f"Unsafe archive member path: {member.name}")
+        tar.extractall(path=target_parent)
+
+
+def load_dataset(cfg: dict) -> tuple[np.ndarray, pd.DataFrame, list[str]]:
+    judge_dir = JUDGE_OUTPUT_ROOT / cfg["judge_subdir"]
+    if cfg.get("name") == "pku_better":
+        _maybe_extract_pku_better_archive(judge_dir)
+    csv_paths = sorted(judge_dir.glob("*.csv"))
+    if not csv_paths:
+        raise FileNotFoundError(f"No judge outputs found in {judge_dir}")
+
+    judge_columns: dict[str, pd.Series] = {}
+    label_series: pd.Series | None = None
+    expected_len = None
+
+    for csv_path in csv_paths:
+        df = pd.read_csv(csv_path)
+        if expected_len is None:
+            expected_len = len(df)
+        elif len(df) != expected_len:
+            raise ValueError(f"Row count mismatch for {csv_path.name}: {len(df)} vs {expected_len}")
+
+        if label_series is None:
+            if cfg["label_source"] == "csv":
+                label_df = pd.read_csv(cfg["label_path"])
+                label_series = pd.to_numeric(label_df[cfg["label_column"]], errors="coerce")
+            else:
+                if cfg["label_column"] in df.columns:
+                    label_series = pd.to_numeric(df[cfg["label_column"]], errors="coerce")
+                elif "gold_label_num" in df.columns:
+                    label_series = (pd.to_numeric(df["gold_label_num"], errors="coerce") > 0).astype(float)
+                else:
+                    raise ValueError(
+                        f"Could not infer labels for {cfg['name']} from {csv_path.name}: "
+                        f"missing {cfg['label_column']}"
+                    )
+
+            transform = cfg.get("label_transform")
+            if transform is not None:
+                label_series = transform(label_series)
+
+            finite = label_series.dropna().to_numpy(dtype=float)
+            if finite.size:
+                uniq = set(np.unique(finite))
+                if uniq.issubset({-1.0, 0.0, 1.0}) and uniq.intersection({-1.0, 1.0}):
+                    label_series = (label_series > 0).astype(float)
+
+            if label_series.nunique(dropna=True) <= 1 and cfg.get("pref_label_column"):
+                pref_series = extract_pref_labels(df, cfg["pref_label_column"])
+                if pref_series is not None and pref_series.nunique(dropna=True) > 1:
+                    label_series = pref_series
+
+        score_series = None
+        for column in cfg.get("score_columns", SCORE_COLUMN_CANDIDATES):
+            if column not in df.columns:
+                continue
+            series = pd.to_numeric(df[column], errors="coerce")
+            if column == "parsed_output" and series.isna().any():
+                series = df[column].apply(
+                    lambda x: _extract_score_from_text(
+                        x,
+                        min_rating=cfg["min_rating"],
+                        max_rating=cfg["max_rating"],
+                    )
+                )
+                series = pd.to_numeric(series, errors="coerce")
+            score_series = series
+            break
+
+        if score_series is None:
+            continue
+
+        judge_name = csv_path.stem.replace("_prefs", "")
+        score_series = maybe_remap_score_range(score_series, cfg["name"], judge_name)
+        judge_columns[judge_name] = score_series
+
+    if label_series is None:
+        raise ValueError(f"Could not infer labels for dataset {cfg['name']}")
+
+    judge_df = pd.DataFrame(judge_columns)
+    if judge_df.empty:
+        raise ValueError(f"No usable judge scores found in {judge_dir}")
+
+    min_rating = cfg["min_rating"]
+    max_rating = cfg["max_rating"]
+    within_bounds = judge_df.ge(min_rating) & judge_df.le(max_rating)
+    mask = (~label_series.isna()) & within_bounds.all(axis=1) & judge_df.notna().all(axis=1)
+
+    labels = label_series[mask].astype(int).reset_index(drop=True)
+    judge_df = judge_df[mask].reset_index(drop=True)
+
+    label_array = labels.to_numpy(dtype=int)
+    label_array, judge_df = _maybe_flip_all_positive_labels(label_array, judge_df, cfg)
+
+    return label_array.astype(int, copy=False), judge_df, list(judge_df.columns)
 
 
 def parse_args(argv: list[str] | None = None):
@@ -112,9 +485,9 @@ def run(
         return None, None
 
     force_rerun = not use_cache
-    gm_pipeline.set_global_seed(seed)
+    set_global_seed(seed)
 
-    results_dir = gm_common.RESULTS_DIR
+    results_dir = RESULTS_DIR
     results_dir.mkdir(parents=True, exist_ok=True)
 
     output_path = output or (results_dir / "gaussian_mixture_results.csv")
@@ -134,8 +507,8 @@ def run(
     individual_dir = individual_cache_dir or results_dir
     individual_dir.mkdir(parents=True, exist_ok=True)
 
-    selected_configs = gm_pipeline.select_dataset_configs(
-        gm_common.DATASET_CONFIGS,
+    selected_configs = select_dataset_configs(
+        DATASET_CONFIGS,
         datasets=datasets,
         preference_only=preference_only,
     )
@@ -154,7 +527,7 @@ def run(
     state_dir = state_dir or CARE_TENSOR_STATE_DIR
     state_dir.mkdir(parents=True, exist_ok=True)
 
-    cache_data = gm_common.load_cache(cache_path)
+    cache_data = load_cache(cache_path)
     cache_meta = cache_data.setdefault(
         "__meta__",
         {
@@ -191,25 +564,25 @@ def run(
                 if run_baselines and cached_baselines:
                     baseline_records.extend(cached_baselines)
                 judge_registry[ds_name] = cached_entry.get("judges", [])
-                gm_common.write_individual_json(individual_dir, ds_name, cached_entry)
+                write_individual_json(individual_dir, ds_name, cached_entry)
                 continue
 
             if (not run_main) and run_baselines and cached_baselines:
                 print(f"{ds_name}: using cached baselines")
                 baseline_records.extend(cached_baselines)
                 judge_registry[ds_name] = cached_entry.get("judges", [])
-                gm_common.write_individual_json(individual_dir, ds_name, cached_entry)
+                write_individual_json(individual_dir, ds_name, cached_entry)
                 continue
 
             if status == "error":
                 reason = cached_entry.get("error", "previous failure")
                 print(f"{ds_name}: skipping (cached error: {reason})")
                 skipped_datasets[ds_name] = reason
-                gm_common.write_individual_json(individual_dir, ds_name, cached_entry)
+                write_individual_json(individual_dir, ds_name, cached_entry)
                 continue
 
         try:
-            y, judge_df, judge_names = gm_common.load_dataset(cfg)
+            y, judge_df, judge_names = load_dataset(cfg)
         except Exception as exc:  # pragma: no cover - defensive logging
             reason = str(exc)
             print(f"{ds_name}: skipped during load -> {reason}")
@@ -218,8 +591,8 @@ def run(
                 "error": reason,
                 "timestamp": datetime.utcnow().isoformat(timespec="seconds"),
             }
-            gm_common.save_cache(cache_data, cache_path)
-            gm_common.write_individual_json(individual_dir, ds_name, dataset_cache[ds_name])
+            save_cache(cache_data, cache_path)
+            write_individual_json(individual_dir, ds_name, dataset_cache[ds_name])
             skipped_datasets[ds_name] = reason
             continue
 
@@ -236,8 +609,8 @@ def run(
                 "judges": judge_names,
                 "timestamp": datetime.utcnow().isoformat(timespec="seconds"),
             }
-            gm_common.save_cache(cache_data, cache_path)
-            gm_common.write_individual_json(individual_dir, ds_name, dataset_cache[ds_name])
+            save_cache(cache_data, cache_path)
+            write_individual_json(individual_dir, ds_name, dataset_cache[ds_name])
             skipped_datasets[ds_name] = reason
             continue
 
@@ -252,10 +625,10 @@ def run(
             pos_rate = float(np.clip(np.mean(y), 0.0, 1.0))
             class_balance = float(np.clip((1.0 - pos_rate) * 100.0, 0.0, 100.0))
 
-            idx_val, idx_test = gm_pipeline.split_indices(
+            idx_val, idx_test = split_indices(
                 y,
                 seed=seed,
-                val_fraction=gm_pipeline.VALIDATION_FRACTION,
+                val_fraction=VALIDATION_FRACTION,
             )
 
             judge_scores_matrix = judge_df.to_numpy(dtype=float)
@@ -263,7 +636,7 @@ def run(
                 judge_scores_matrix,
                 class_balance=class_balance,
                 ranks=cfg.get("ranks", (4, 5, 6, 7)),
-                tensor_opts=gm_common.FAST_TENSOR_OPTS,
+                tensor_opts=FAST_TENSOR_OPTS,
                 solver_kwargs=solver_kwargs,
                 dataset_name=ds_name,
                 state_cache_dir=state_dir,
@@ -274,8 +647,8 @@ def run(
             best_preds = None
             last_error = None
 
-            for lam_L in gm_common.LAM_L_GRID:
-                for lam_S in gm_common.LAM_S_GRID:
+            for lam_L in LAM_L_GRID:
+                for lam_S in LAM_S_GRID:
                     try:
                         preds, meta = aggregator.predict(lam_L=lam_L, lam_S=lam_S)
                     except Exception as exc:  # pragma: no cover - defensive logging
@@ -307,8 +680,8 @@ def run(
                     "judges": judge_names,
                     "timestamp": datetime.utcnow().isoformat(timespec="seconds"),
                 }
-                gm_common.save_cache(cache_data, cache_path)
-                gm_common.write_individual_json(individual_dir, ds_name, dataset_cache[ds_name])
+                save_cache(cache_data, cache_path)
+                write_individual_json(individual_dir, ds_name, dataset_cache[ds_name])
                 skipped_datasets[ds_name] = reason
                 continue
 
@@ -320,12 +693,12 @@ def run(
             uws_scores = np.asarray(uws_aggregate(judge_df), dtype=float)
             uws_pred = np.asarray((uws_scores >= cfg["binary_threshold"]).astype(int))
 
-            care_svd_gamma, care_svd_val_acc, care_svd_scores = gm_pipeline.tune_care_svd_gamma(
+            care_svd_gamma, care_svd_val_acc, care_svd_scores = tune_care_svd_gamma(
                 judge_df,
                 y,
                 idx_val=idx_val,
                 threshold=cfg["binary_threshold"],
-                gamma_grid=gm_pipeline.CARE_SVD_GAMMA_GRID,
+                gamma_grid=CARE_SVD_GAMMA_GRID,
             )
             care_svd_pred = np.asarray((care_svd_scores >= cfg["binary_threshold"]).astype(int))
 
@@ -435,10 +808,10 @@ def run(
         if metrics is not None:
             entry["metrics"] = metrics
             entry["hyperparams"] = {
-                "lam_L_grid": list(gm_common.LAM_L_GRID),
-                "lam_S_grid": list(gm_common.LAM_S_GRID),
+                "lam_L_grid": list(LAM_L_GRID),
+                "lam_S_grid": list(LAM_S_GRID),
                 "ranks": list(cfg.get("ranks", (4, 5, 6, 7))),
-                "care_svd_gamma_grid": list(gm_pipeline.CARE_SVD_GAMMA_GRID),
+                "care_svd_gamma_grid": list(CARE_SVD_GAMMA_GRID),
             }
             entry["care_tensor_meta"] = {
                 "best": best_meta,
@@ -457,8 +830,8 @@ def run(
             entry["baseline_records"] = ds_baseline_records
 
         dataset_cache[ds_name] = entry
-        gm_common.save_cache(cache_data, cache_path)
-        gm_common.write_individual_json(individual_dir, ds_name, entry)
+        save_cache(cache_data, cache_path)
+        write_individual_json(individual_dir, ds_name, entry)
 
     main_path = None
     baselines_path = None

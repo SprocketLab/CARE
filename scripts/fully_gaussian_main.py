@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import random
 from pathlib import Path
 
 import numpy as np
@@ -36,7 +37,6 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.append(str(SCRIPT_DIR))
 
 from eval_tools import collect_metrics  # noqa: E402
-import fully_gaussian_pipeline as fg_pipeline  # noqa: E402
 from binary_baselines import BASELINE_METHODS, run_all_methods  # noqa: E402
 from dataset_aliases import normalize_dataset_list, normalize_fully_gaussian_dataset  # noqa: E402
 
@@ -45,7 +45,7 @@ DEFAULT_RANDOM_SEED = 2024
 GAMMA_GRID = [0.1, 0.2, 0.25, 0.5, 0.75, 1, 2, 3, 5, 7, 10]
 LEARN_STRUCTURE_SOLVER_KW = dict(max_iters=10000)
 
-DATASETS = fg_pipeline.DATASETS
+DATASETS = ["asset"]
 
 ORDERED_METHODS = ['MV', 'AVG', 'WS', 'UWS', 'CARE-SVD']
 METHOD_LABELS = {
@@ -60,7 +60,16 @@ DATASET_LABELS = {
 }
 
 
-set_global_seed = fg_pipeline.set_global_seed
+def set_global_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    try:
+        import torch
+    except ImportError:  # pragma: no cover
+        return
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():  # pragma: no cover
+        torch.cuda.manual_seed_all(seed)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
