@@ -2,6 +2,8 @@
 
 [Jitian Zhao*](https://jzhao326.github.io/), [Changho Shin*](https://ch-shin.github.io/), [Tzu-Heng Huang](https://zihengh1.github.io/), [Satya Sai Srinath Namburi GNVV](https://namburisrinath.github.io/index.html), [Frederic Sala](https://pages.cs.wisc.edu/~fredsala/)
 
+<img width="725" height="159" alt="image" src="https://github.com/user-attachments/assets/8b964d70-127f-4aad-a4cc-847512dfac60" />
+
 Paper Link: [TBD](https://arxiv.org/abs/2412.03881)
 
 ## Abstract
